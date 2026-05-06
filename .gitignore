@@ -1,0 +1,13 @@
+# Tuist
+Derived/
+*.xcodeproj/
+*.xcworkspace/
+.tuist-bin/
+.build/
+
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
