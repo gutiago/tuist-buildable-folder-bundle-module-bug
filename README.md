@@ -1,16 +1,36 @@
-# Tuist `buildableFolders:` skips `Bundle.module` synthesis when resources are outside the allowlist
+# Tuist `buildableFolders` + `.staticFramework` + `.xcassets` drops auto-generated `ImageResource` symbols
 
-Minimal reproducible bug for **Tuist `4.170.0`**.
+Minimal reproducible bug for **Tuist `4.192.0`** + **Xcode `26.4.1`**.
 
 ## The bug
 
-When a target uses `buildableFolders:` and its resource files all have
-extensions outside Tuist's hard-coded allowlist (e.g. `.jpg`, `.png`, `.ttf`,
-`.heic`, `.aar`), Tuist treats the target as having no resources and skips
-synthesis of `TuistBundle+<Target>.swift`. As a result, `Bundle.module` does
-not resolve and any code referencing it fails to compile with
-`error: type 'Bundle' has no member 'module'`. The same target switched from
-`buildableFolders:` to explicit `sources:` + `resources:` builds successfully.
+When a Tuist target declares:
+- `product: .staticFramework`
+- `buildableFolders: ["…"]` (Xcode 16's filesystem-synchronized groups)
+- a `.xcassets` somewhere inside the buildable folder
+
+Tuist generates an Xcode project where the framework target's
+`PBXFileSystemSynchronizedRootGroup` carries a
+`PBXFileSystemSynchronizedBuildFileExceptionSet` that lists
+`Resources/Media.xcassets` under `membershipExceptions`. That removes the
+`.xcassets` from the framework target's membership and routes it to a separate
+`<Project>_<Target>` bundle target instead.
+
+Because the `.xcassets` is no longer in the framework target's source/resource
+membership, Xcode never runs the `GenerateAssetSymbols` build step for that
+target. The framework's `DerivedSources/GeneratedAssetSymbols.swift` is never
+written, so any Swift code in the framework that references
+`Image(.assetName)`, `ImageResource.assetName`, or `Color(.assetName)` fails
+to compile with:
+
+```
+error: type 'ImageResource' has no member 'assetName'
+```
+
+Switching the same target to `product: .framework` (dynamic) makes the build
+succeed — the `.xcassets` stays in the framework target's membership,
+`GenerateAssetSymbols` runs, the symbol extension file is populated, and the
+references resolve.
 
 ## Reproduce
 
@@ -18,68 +38,72 @@ not resolve and any code referencing it fails to compile with
 tuist install
 tuist generate --no-open
 
-# Confirms TuistBundle+BugReproWorkaround.swift exists,
-# but TuistBundle+BugRepro.swift is missing:
-ls Derived/Sources/
-
-# Broken target — fails to compile:
 xcodebuild -workspace BugReproApp.xcworkspace \
-           -scheme BugRepro \
-           -destination "generic/platform=iOS Simulator" build
-
-# Working target — same code, same files, succeeds:
-xcodebuild -workspace BugReproApp.xcworkspace \
-           -scheme BugReproWorkaround \
-           -destination "generic/platform=iOS Simulator" build
+           -scheme BugReproApp \
+           -destination "generic/platform=iOS Simulator" \
+           build
 ```
 
-Expected build error for `BugRepro`:
+Expected error:
 
 ```
-Sources/BugRepro/BugRepro.swift:10:12: error: type 'Bundle' has no member 'module'
-    Bundle.module.url(forResource: "sample", withExtension: "png")
-           ^~~~~~
+Packages/MyLib/Sources/MyLib/MyLib.swift:9:12: error: type 'ImageResource' has no member 'actionDeleted'
+    Image(.actionDeleted)
+           ^~~~~~~~~~~~~
 ```
 
-## Root cause (Tuist 4.170.0 source links)
+## The smoking gun in the generated pbxproj
 
-1. [`ResourcesProjectMapper.mapTarget`](https://github.com/tuist/tuist/blob/4.170.0/cli/Sources/TuistGenerator/Mappers/ResourcesProjectMapper.swift#L41-L48)
-   early-returns when the target has no recognised resources, skipping bundle
-   synthesis.
-2. [`BuildableFolderChecker.containsResources`](https://github.com/tuist/tuist/blob/4.170.0/cli/Sources/TuistGenerator/Generator/BuildableFolderChecker.swift#L25-L31)
-   only reports a folder as containing resources if files match an allowlist.
-3. [`Target.validResourceExtensions`](https://github.com/tuist/tuist/blob/4.170.0/cli/Sources/XcodeGraph/Sources/XcodeGraph/Models/Target.swift#L16-L25) —
-   the allowlist. It excludes `.jpg`, `.png`, `.ttf`, `.heic`, `.aar`, and
-   many other common image/font/binary extensions.
+In `Packages/MyLib/MyLib.xcodeproj/project.pbxproj`:
 
-`Project.swift` sets `resourceSynthesizers: []`. With Tuist's default
-synthesizers, `containsSynthesizedFilesInBuildableFolders` returns true for
-`.png`/`.jpg`/`.ttf` (because they are SwiftGen synthesizer extensions) and
-masks this bug. Disabling the synthesizers — common in projects that supply
-their own asset / string generation pipeline — surfaces it.
+```
+/* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+    isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+    membershipExceptions = (
+        Resources/Media.xcassets,
+    );
+    target = … /* MyLib */;
+};
+```
 
-## Affected extensions discovered in a real production codebase
-
-Inventory of files under `Sources/.../Resources/` and `Tests/.../Resources/`
-that are NOT covered by Tuist's allowlist. None trigger bundle synthesis
-under `buildableFolders:` + `resourceSynthesizers: []`:
-
-| Extension | Where seen        | In allowlist? |
-| --------- | ----------------- | ------------- |
-| `.png`    | sources + tests   | No            |
-| `.jpg`    | sources + tests   | No            |
-| `.ttf`    | sources           | No            |
-| `.aar`    | sources + tests   | No            |
-| `.heic`   | tests             | No            |
-| `.pem`    | tests             | No            |
-| `.html`   | tests             | No            |
-| `.csv`    | tests             | No            |
-| `.der`    | tests             | No            |
-| `.crt`    | tests             | No            |
+The framework target (`MyLib`) explicitly excludes the `.xcassets` from its
+own membership. A second exception set excludes the framework target's Swift
+files from the bundle target's membership. Net effect: `.xcassets` lives in
+the bundle target, Swift files live in the framework target — but the symbol
+generation step is bound to the framework target's `.xcassets` membership,
+which no longer exists.
 
 ## Workaround
 
-For affected targets, drop `buildableFolders:` and use explicit `sources:` +
-`resources:` globs (see the `BugReproWorkaround` target). Tuist then keys
-synthesis off `target.resources.resources.isEmpty == false`, so the bundle
-accessor is generated regardless of extension.
+Switch the affected target from `.staticFramework` to `.framework` in its
+`Project.swift`:
+
+```swift
+.target(
+    name: "MyLib",
+    product: .framework,         // was: .staticFramework
+    …
+    buildableFolders: ["Sources/MyLib"]
+)
+```
+
+That keeps the `.xcassets` in the framework target's membership and restores
+the `GenerateAssetSymbols` step. The trade-off is a dynamic framework instead
+of a static one for this target.
+
+## Repo layout
+
+```
+.
+├── Project.swift                    # App target → .project(target: "MyLib", path: "Packages/MyLib")
+├── Tuist.swift
+├── App/AppMain.swift                # @main App showing MyLibView
+└── Packages/MyLib/
+    ├── Project.swift                # .staticFramework + buildableFolders ["Sources/MyLib"]
+    └── Sources/MyLib/
+        ├── MyLib.swift              # Image(.actionDeleted) — fails to compile
+        └── Resources/Media.xcassets/
+            ├── action-deleted.imageset/
+            ├── ai-doc-converter.imageset/
+            └── ai-prompt.imageset/
+```
