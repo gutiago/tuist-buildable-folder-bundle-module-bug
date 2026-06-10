@@ -4,6 +4,7 @@ Derived/
 *.xcworkspace/
 .tuist-bin/
 .build/
+Tuist/.build/
 
 # macOS
 .DS_Store

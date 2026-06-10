@@ -1,52 +1,55 @@
 import ProjectDescription
 
-// NOTE: `resourceSynthesizers: []` mirrors how a project that supplies its own
-// asset / string generation pipeline configures Tuist (i.e. not relying on
-// SwiftGen's defaults). With the default synthesizers, the
-// `containsSynthesizedFilesInBuildableFolders` check in
-// `ResourcesProjectMapper.mapTarget` returns true for `.png` / `.jpg` / `.ttf`
-// and masks this bug. Disabling them surfaces it — and matches a real
-// production setup that uses Tuist's `buildableFolders:`.
 let project = Project(
-  name: "BugReproApp",
+  name: "App",
   targets: [
-    // Broken case: `buildableFolders:` + resources whose extensions are
-    // outside `Target.validResourceExtensions`
-    // (e.g. `.jpg`, `.png`, `.ttf`, `.heic`, `.aar`).
-    // `BuildableFolderChecker.containsResources` returns false →
-    // `ResourcesProjectMapper.mapTarget` early-returns →
-    // `TuistBundle+BugRepro.swift` is NOT generated →
-    // `Bundle.module` does not resolve and the target fails to compile.
+    // Issue A: infoPlist + xcconfigs live INSIDE the "App" buildable folder.
+    // Tuist generates a flat root-level PBXFileReference for each of them,
+    // duplicating the entries already shown inside the synchronized folder.
     .target(
-      name: "BugRepro",
+      name: "App",
       destinations: .iOS,
-      product: .framework,
-      bundleId: "com.example.bugrepro",
-      deploymentTargets: .iOS("16.0"),
-      infoPlist: .default,
+      product: .app,
+      bundleId: "io.tuist.repro.app",
+      deploymentTargets: .iOS("17.0"),
+      infoPlist: .file(path: "App/Supporting/App-Info.plist"),
       buildableFolders: [
-        "Sources/BugRepro",
-      ]
-    ),
-    // Working case: identical Swift, identical resource files, but the target
-    // uses explicit `sources:` + `resources:` globs.
-    // `target.resources.resources.isEmpty == false` short-circuits the early
-    // return, Tuist synthesises `TuistBundle+BugReproWorkaround.swift`,
-    // and `Bundle.module` resolves.
-    .target(
-      name: "BugReproWorkaround",
-      destinations: .iOS,
-      product: .framework,
-      bundleId: "com.example.bugreproworkaround",
-      deploymentTargets: .iOS("16.0"),
-      infoPlist: .default,
-      sources: [
-        "SourcesWorkaround/BugReproWorkaround/**/*.swift",
+        .folder(
+          "App",
+          exceptions: [
+            // Keep the manifest-referenced Info.plist out of the build phases
+            // so it isn't double-copied; the flat root-level reference is
+            // still generated regardless.
+            .exception(excluded: ["Supporting/App-Info.plist"]),
+          ]
+        ),
       ],
-      resources: [
-        "SourcesWorkaround/BugReproWorkaround/Resources/**",
+      settings: .settings(
+        configurations: [
+          .debug(name: "Debug", xcconfig: "App/Supporting/Configurations/App-Debug.xcconfig"),
+          .release(name: "Release", xcconfig: "App/Supporting/Configurations/App-Release.xcconfig"),
+        ]
+      )
+    ),
+    // Issue B: SharedStub.swift physically lives inside App's buildable
+    // folder but must also compile into AppTests. The only manifest API is an
+    // explicit sources: glob, which materialises another flat root-level
+    // PBXFileReference. Xcode models this natively with a
+    // PBXFileSystemSynchronizedBuildFileExceptionSet whose target is the
+    // foreign target — no API for that in Tuist.
+    .target(
+      name: "AppTests",
+      destinations: .iOS,
+      product: .unitTests,
+      bundleId: "io.tuist.repro.tests",
+      deploymentTargets: .iOS("17.0"),
+      sources: [
+        .glob("App/SharedStub.swift"),
+      ],
+      buildableFolders: ["AppTests"],
+      dependencies: [
+        .target(name: "App"),
       ]
     ),
-  ],
-  resourceSynthesizers: []
+  ]
 )
