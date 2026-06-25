@@ -94,10 +94,24 @@ When the static xcframework is instead reached as a **static-xcframework-linked-
    `Headers` dir to `HEADER_SEARCH_PATHS` when the module is already provided via
    `-fmodule-map-file`.
 
-These two require the dynamic-xcframework→static-xcframework graph edge (a real
-binary distribution) to trigger and are **not** reproduced by this minimal sample;
-they are documented here because they share the same root cause — Tuist handling a
-static xcframework whose clang module map uses a non-matching header name.
+### What makes the mapper fire (and why this minimal sample doesn't hit #1/#2)
+
+`StaticXCFrameworkModuleMapGraphMapper` only runs when a **precompiled dynamic**
+framework/xcframework has the static xcframework as a graph dependency
+(`precompiledDynamicLibrariesAndFrameworks` → `filterDependencies(from:)`).
+A plain Tuist `.target` is **never** precompiled
+([`GraphDependency.isPrecompiled`](https://github.com/tuist/tuist/blob/main/cli/Sources/XcodeGraph/Sources/XcodeGraph/Graph/GraphDependency.swift)
+returns `false` for `.target`), so a framework *wrapper target* around the static
+xcframework — by itself — cannot trigger it. That's why `tuist generate` here never
+produces a derived module map.
+
+The edge appears once **binary caching is enabled** (`enableCaching: true`): Tuist's
+cache replaces the wrapper *target* with a **precompiled dynamic xcframework** that
+depends on the static C xcframework, and *that* precompiled-dynamic → static edge is
+what fires the mapper. (Verified: `tuist cache MathCoreLib` here produces a dynamic
+`MathCoreLib.xcframework`.) So #1 and #2 reproduce in a caching-enabled project once
+the wrapper is materialized from the cache as a dynamic xcframework — which is why
+they show up in the original codebase but not in this cache-less minimal sample.
 
 ## What's in this repo
 
