@@ -1,0 +1,4 @@
+module MathCore {
+    header "math_core.h"
+    export *
+}

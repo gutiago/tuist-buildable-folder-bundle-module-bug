@@ -2,12 +2,16 @@
 Derived/
 *.xcodeproj/
 *.xcworkspace/
-.tuist-bin/
 .build/
+Fixtures/.build/
+Vendor/.build/
+
+# Unused fixture (not part of this minimal repro)
+Fixtures/Engine.xcframework/
+# Vendor package has only a binary target — no sources
+Vendor/Sources/
 
 # macOS
 .DS_Store
-
-# Xcode user data
 xcuserdata/
 *.xcuserstate
