@@ -1,125 +1,120 @@
-# `enforceExplicitDependencies` can't resolve a C module from a static xcframework reached through a dynamic-framework wrapper
+# Tuist mishandles a static C xcframework (mismatched-header module map) reached through a cached dynamic-framework wrapper
 
-Reproducible bug for **Tuist `4.199.2`** (Xcode 26, explicit modules).
+Reproducible bugs in **Tuist `4.199.2`** (Xcode 26, explicit modules) in how
+[`StaticXCFrameworkModuleMapGraphMapper`](https://github.com/tuist/tuist/blob/main/cli/Sources/TuistKit/Mappers/Graph/StaticXCFrameworkModuleMapGraphMapper.swift)
+re-exposes a **static C xcframework** that is linked by a **precompiled dynamic
+framework** (produced by the binary cache).
 
-## The bug
-
-A common vendoring shape:
-
-```
-Feature (framework)  ──▶  MathCoreLib (framework wrapper)  ──▶  .external("MathCore")
-```
-
-- `MathCore` is a **static C xcframework** with a clang module map (`module MathCore { header "math_core.h" }`).
-- `MathCoreLib` is a thin **framework** that wraps it (mirrors a real "link the C archive once" wrapper target). It depends on `.external(name: "MathCore")` and force-loads it (`-all_load`); it does not itself `import MathCore`.
-- `Feature` `import MathCore` and is built **through** `MathCoreLib` — so `MathCore` is a *transitive* module dependency of `Feature`.
-
-With `enforceExplicitDependencies: true` the build fails:
+## The graph
 
 ```
-error: unable to resolve module dependency: 'MathCore'
-import MathCore
-       ^ (in target 'Feature')
+App/Feature (framework)  ──▶  Wrapper/MathCoreLib (framework)  ──▶  .external("MathCore")
 ```
 
-The same project builds fine with the flag off, **and** Tuist's own
-`tuist inspect dependencies --only implicit` reports **no issue** — so Tuist's
-implicit-dependency analysis and its `enforceExplicitDependencies` build
-**disagree**.
+- `MathCore` is a **static C xcframework** whose clang module map references a header
+  whose name does **not** match the xcframework basename:
+  ```
+  MathCore.xcframework/ios-arm64/Headers/
+  ├── math_core.h          # ← snake_case, ≠ "MathCore"
+  └── module.modulemap     # module MathCore { header "math_core.h" export * }
+  ```
+- `MathCoreLib` is a thin framework wrapper that links `MathCore` (`-all_load`) and is
+  shared by consumers. It lives in its own project (the `Wrapper` project), exactly like
+  a real "link the static C archive once" target.
+- `Feature` `import MathCore` (reached transitively through `MathCoreLib`).
+
+## Why the binary cache is required
+
+`StaticXCFrameworkModuleMapGraphMapper` only fires when a **precompiled dynamic**
+framework/xcframework has the static xcframework as a graph dependency
+(`precompiledDynamicLibrariesAndFrameworks` → `filterDependencies(from:)`). A plain Tuist
+`.target` is **never** precompiled
+([`GraphDependency.isPrecompiled`](https://github.com/tuist/tuist/blob/main/cli/Sources/XcodeGraph/Sources/XcodeGraph/Graph/GraphDependency.swift)
+returns `false` for `.target`), so the wrapper *target* alone can't trigger it.
+
+Tuist's **binary cache** materializes `MathCoreLib` as a **precompiled dynamic
+xcframework** that depends on the static `MathCore` xcframework — and *that*
+precompiled-dynamic → static edge is what fires the mapper. So the bug only reproduces
+when a consumer is built against the **cached** wrapper.
 
 ## Reproduce (verified)
 
+Requires a Tuist account (binary cache). Set `fullHandle` in `Tuist.swift` to your own
+project and log in:
+
 ```bash
-sh Fixtures/build_fixtures.sh     # build MathCore.xcframework (static C, mismatched header)
+tuist auth login
+# tuist project create <account>/<handle> --build-system xcode   # if you need one
+
+sh Fixtures/build_fixtures.sh          # build MathCore.xcframework (static C, mismatched header)
 tuist install
-tuist generate --no-open
-
-# Tuist says the graph is clean:
-tuist inspect dependencies --only implicit
-#  ▸ "We did not find any dependency issues in your project (checked: implicit)."
-
-# …but the build fails (flag ON):
-xcodebuild build -workspace ReproApp.xcworkspace -scheme Feature \
-  -destination "generic/platform=iOS Simulator" \
-  CODE_SIGNING_ALLOWED=NO -skipPackagePluginValidation
-#  ▸ error: unable to resolve module dependency: 'MathCore'
+tuist generate
+tuist cache MathCoreLib                # cache the wrapper → precompiled dynamic xcframework
+tuist cache Feature                    # build the consumer against the cached wrapper
 ```
 
-Control — set `Tuist.swift` to `let tuist = Tuist()` (flag off), regenerate, build the same scheme → **BUILD SUCCEEDED**. (`enforceExplicitDependencies` is what turns on `-explicit-module-build` here.)
+The last step **fails**:
 
-| Configuration | `tuist inspect … --only implicit` | `xcodebuild` |
-| --- | --- | --- |
-| `enforceExplicitDependencies: true`  | passes (no issue) | **fails** — unable to resolve `MathCore` |
-| flag off                             | passes (no issue) | succeeds |
+```
+error: clang dependency scanning failure:
+  …/Tuist/.build/tuist-derived/XCFrameworks/MathCore/Headers/module.modulemap:2:12:
+  error: header 'math_core.h' not found
+fatal error: could not build module 'MathCore'
+App/Sources/Feature/Feature.swift:1:8: error: unable to resolve module dependency: 'MathCore'
+```
 
-## Root cause
+(The mapper created `Tuist/.build/tuist-derived/XCFrameworks/MathCore/Headers/module.modulemap`,
+but the header it references was never copied next to it.)
 
-`enforceExplicitDependencies` makes Tuist build with `-explicit-module-build` and
-gives each target a generated `Derived/ModuleMaps/<Target>-deps.modulemap` that the
-Swift dependency scanner reads. That file lists the target's clang-module
-dependencies as `extern module …` entries — **but the C module from a static
-xcframework reached transitively through the framework wrapper is omitted**. The
-module is available to the linker/compiler search paths, yet it is never registered
-with the explicit-module scanner, so `import MathCore` cannot be resolved.
+## The bugs
 
-Crucially this is inconsistent with [`GraphTraverser`](https://github.com/tuist/tuist/blob/main/cli/Sources/TuistCore/Graph/GraphTraverser.swift)'s
-implicit-dependency analysis (what `tuist inspect dependencies --only implicit`
-uses): it treats the transitively-reachable `MathCore` as satisfied and reports
-nothing, so a user gets a clean bill of health and then a broken build with no
-guidance once the flag is enabled.
+### Bug 1 — derived umbrella header never copied (header name ≠ xcframework name) — **reproduced above**
+[`generateModuleMapAndUmbrellaHeader`](https://github.com/tuist/tuist/blob/main/cli/Sources/TuistKit/Mappers/Graph/StaticXCFrameworkModuleMapGraphMapper.swift)
+globs the umbrella header by the **xcframework basename**:
 
-**Fix:** when `enforceExplicitDependencies` is on, emit an `extern module`
-entry (pointing at the xcframework's module map) into the `-deps.modulemap` of
-every target that transitively imports a clang module from a static xcframework —
-or make `inspect dependencies --only implicit` flag the same case the
-`enforceExplicitDependencies` build rejects, so detection and enforcement agree.
+```swift
+let name = xcframework.path.basenameWithoutExt          // "MathCore"
+let umbrellaHeader = try await fileSystem
+    .glob(directory: xcframework.path, include: ["**/\(name).h"])   // looks for **/MathCore.h
+    .collect().first
+```
 
-## Two related issues in the same code path
+The real header is `math_core.h`, so the glob returns `nil`, the header is never copied
+next to the derived module map, and the build fails with `header 'math_core.h' not found`.
+**Fix:** resolve the umbrella header from the module map's own `header "…"` declaration
+(or copy the whole `Headers` directory), instead of assuming the xcframework name.
 
-When the static xcframework is instead reached as a **static-xcframework-linked-by-a-dynamic-xcframework** (handled by [`StaticXCFrameworkModuleMapGraphMapper`](https://github.com/tuist/tuist/blob/main/cli/Sources/TuistKit/Mappers/Graph/StaticXCFrameworkModuleMapGraphMapper.swift)), the same mismatched-header xcframework also triggers:
+### Bug 2 — module declared twice → "redefinition of module" (behind Bug 1)
+The mapper sets `-fmodule-map-file` to the **derived** module map *and* `HEADER_SEARCH_PATHS`
+to the **original** `Headers` dir (which also contains a `module.modulemap`). Once Bug 1 is
+worked around (header provided), Xcode 26's explicit-module scanner sees two module maps for
+the same module → `redefinition of module 'MathCore'`. **Fix:** don't add the original
+`Headers` dir to `HEADER_SEARCH_PATHS` when the module is already provided via
+`-fmodule-map-file`.
 
-1. **Header never copied (header name ≠ xcframework name).**
-   [`generateModuleMapAndUmbrellaHeader`](https://github.com/tuist/tuist/blob/main/cli/Sources/TuistKit/Mappers/Graph/StaticXCFrameworkModuleMapGraphMapper.swift)
-   globs `**/<xcframeworkBasename>.h` (`MathCore.h`) for the umbrella header, but the
-   real header is `math_core.h`, so it returns `nil` and the header is not copied next
-   to the derived module map → `module map references header 'math_core.h' not found`.
-   *Fix:* read the header from the module map's `header "…"` declaration instead of
-   assuming the xcframework name.
+### Bug 3 — `enforceExplicitDependencies` can't resolve a transitively-imported C module
+Independently of the cache: with `enforceExplicitDependencies: true`, a target that imports
+the C module transitively through the wrapper fails the explicit-module build
+(`unable to resolve module dependency: 'MathCore'`) while
+`tuist inspect dependencies --only implicit` reports **no issue** — Tuist's implicit
+analysis and its enforcement disagree. **Fix:** emit an `extern module` entry for the
+xcframework's module into each consumer's `-deps.modulemap`, or make `inspect` flag the
+same case the build rejects.
 
-2. **Module declared twice → "redefinition of module".**
-   The mapper sets `-fmodule-map-file` to the **derived** module map *and*
-   `HEADER_SEARCH_PATHS` to the **original** `Headers` directory (which also contains a
-   `module.modulemap`). Xcode 26's explicit-module scanner then sees two module maps for
-   the same module → `redefinition of module 'MathCore'`. *Fix:* don't add the original
-   `Headers` dir to `HEADER_SEARCH_PATHS` when the module is already provided via
-   `-fmodule-map-file`.
+## Summary of Tuist-side fixes
 
-### What makes the mapper fire (and why this minimal sample doesn't hit #1/#2)
+1. Derive the umbrella header from the module map's `header "…"` declaration, not the xcframework name.
+2. Stop double-declaring the module (`-fmodule-map-file` + `HEADER_SEARCH_PATHS` to a dir containing a module map).
+3. Under `enforceExplicitDependencies`, register the static xcframework's module in consumers' `-deps.modulemap` (and align `inspect dependencies` with it).
 
-`StaticXCFrameworkModuleMapGraphMapper` only runs when a **precompiled dynamic**
-framework/xcframework has the static xcframework as a graph dependency
-(`precompiledDynamicLibrariesAndFrameworks` → `filterDependencies(from:)`).
-A plain Tuist `.target` is **never** precompiled
-([`GraphDependency.isPrecompiled`](https://github.com/tuist/tuist/blob/main/cli/Sources/XcodeGraph/Sources/XcodeGraph/Graph/GraphDependency.swift)
-returns `false` for `.target`), so a framework *wrapper target* around the static
-xcframework — by itself — cannot trigger it. That's why `tuist generate` here never
-produces a derived module map.
-
-The edge appears once **binary caching is enabled** (`enableCaching: true`): Tuist's
-cache replaces the wrapper *target* with a **precompiled dynamic xcframework** that
-depends on the static C xcframework, and *that* precompiled-dynamic → static edge is
-what fires the mapper. (Verified: `tuist cache MathCoreLib` here produces a dynamic
-`MathCoreLib.xcframework`.) So #1 and #2 reproduce in a caching-enabled project once
-the wrapper is materialized from the cache as a dynamic xcframework — which is why
-they show up in the original codebase but not in this cache-less minimal sample.
-
-## What's in this repo
+## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `Fixtures/build_fixtures.sh`, `Fixtures/src/` | Builds `MathCore.xcframework` (static C, header `math_core.h` ≠ `MathCore`, hand-written module map). |
-| `Fixtures/MathCore.xcframework` | Pre-built fixture, committed so the sample is self-contained. |
+| `Fixtures/build_fixtures.sh`, `Fixtures/src/` | Builds `MathCore.xcframework` (static C; header `math_core.h` ≠ `MathCore`). |
+| `Fixtures/MathCore.xcframework` | Pre-built fixture, committed. |
 | `Vendor/Package.swift` | SwiftPM package vending `MathCore` as a binary target. |
-| `Project.swift` | `MathCoreLib` framework wrapper + `Feature` consumer. |
-| `Tuist.swift` | `generationOptions: .options(enforceExplicitDependencies: true)`. |
-| `Sources/Feature/Feature.swift` | `import MathCore`. |
+| `Wrapper/Project.swift` | `MathCoreLib` framework wrapper (`.external("MathCore")`, `-all_load`). |
+| `App/Project.swift` | `Feature` framework that `import MathCore` through the wrapper. |
+| `Workspace.swift` | Ties the `App` and `Wrapper` projects together. |
+| `Tuist.swift` | `enableCaching` + `enforceExplicitDependencies`; set your own `fullHandle`. |
